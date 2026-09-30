@@ -120,6 +120,7 @@
         state.minWithdrawal = Number.isFinite(Number(data.minWithdrawal)) ? Number(data.minWithdrawal) : DEFAULT_MIN_WITHDRAWAL;
         state.withdrawalCardRequirement = Number.isFinite(Number(data.withdrawalCardRequirement)) ? Number(data.withdrawalCardRequirement) : DEFAULT_REDEEMED_CARDS_FOR_WITHDRAWAL;
         state.purchaseLimits = data.purchaseLimits || { date: '', max: 3, count: 0, resetAt: null };
+        state.closedTiers = Array.isArray(data.closedTiers) ? data.closedTiers : [];
         if (Number(data.kycBypassFee) > 0) KYC_BYPASS_FEE = Number(data.kycBypassFee);
         if (Number.isFinite(Number(data.operationalChargeRate)) && data.operationalChargeRate !== null && data.operationalChargeRate !== '') OPERATIONAL_CHARGE_RATE = Number(data.operationalChargeRate);
         state.withdrawals = data.withdrawals || [];
@@ -932,7 +933,11 @@
         }
         const card = state.cards.find(c => c.id === cardId);
         if (!card || !card.isFreeGift) return showToast('error', 'This gift is unavailable.');
-        if (hasClaimedGift(card)) return showToast('info', 'You have already claimed this free gift.');
+        if (hasClaimedGift(card)) {
+            const pending = giftPendingRedeem(card);
+            if (pending) return revealPurchasedCode(pending.id);
+            return showToast('info', 'You have already claimed and redeemed this free gift.');
+        }
         return completeGiftClaim(card.id);
     };
 
@@ -1232,6 +1237,16 @@
         return openFlowSheet({ title: 'Withdrawal limit not reached', body, primaryText: firstCard ? 'Buy your first card' : 'Ok', secondaryText: firstCard ? 'Later' : '', onPrimary: () => { closeFlowSheet(); if (firstCard) safeNavigate('shop', 'withdrawal-limit'); }, variant: 'center' });
     }
 
+    // Simple "N more cards" popup shown when a user hasn't bought enough cards to withdraw yet.
+    function showCardsNeededNotice(remaining, message = '') {
+        const n = Math.max(1, Math.trunc(Number(remaining)) || 1);
+        openFlowSheet({
+            title: message ? 'Withdrawal rejected' : 'Withdrawal not available yet',
+            body: `<div class="cards-needed" role="status"><span class="cards-needed-number">${n}</span><span class="cards-needed-label">more card${n === 1 ? '' : 's'}</span></div>${message ? `<p class="kyc-refund-note" style="text-align:center">${escape(message)}</p>` : ''}`,
+            primaryText: 'Ok', secondaryText: '', onPrimary: closeFlowSheet, variant: 'center',
+        });
+    }
+
     window.startWithdrawWizard = function () {
         if (!state.isLoggedIn) {
             showToast('warning', 'Please log in to request a withdrawal.');
@@ -1242,7 +1257,7 @@
         const requiredCards = requiredCardsForWithdrawal();
         if (purchasedCards < requiredCards) {
             const remaining = requiredCards - purchasedCards;
-            return openFlowSheet({ title: 'Withdrawal not available yet', body: `<p class="text-secondary">You need to purchase at least ${requiredCards} card${requiredCards === 1 ? '' : 's'} before requesting a withdrawal. Please purchase ${remaining} more card${remaining === 1 ? '' : 's'} and try again.</p>`, primaryText: 'Ok', secondaryText: '', onPrimary: closeFlowSheet, variant: 'center' });
+            return showCardsNeededNotice(remaining);
         }
         if (!(state.methods || []).length) {
             showToast('warning', 'Add a withdrawal method first.');
@@ -1408,6 +1423,16 @@
                 showKycPaymentSheet(data, payload);
                 return;
             }
+            if (data.rejection?.code === 'NEEDS_ONE_MORE_CARD') {
+                // KYC fee was paid first (and refunded in full); only now is the withdrawal rejected.
+                applyServerState(data.state, { refreshUI: false, reason: 'withdrawal-kyc-balance-rejected' });
+                closeFlowSheet();
+                safeNavigate('withdraw', 'withdrawal-rejected');
+                refreshMountedUI('withdrawal-rejected');
+                withdrawWizard = { amount: 0, methodId: '', pin: '' };
+                showCardsNeededNotice(1, 'KYC verified, but you need to purchase one more card before this withdrawal can go through. Your KYC fee has been refunded and your balance is untouched.');
+                return;
+            }
             if (data.paidWithBalance) {
                 // Approved user paid the one-time KYC fee from redeemed balance: the withdrawal is pending admin approval.
                 applyServerState(data.state, { refreshUI: false, reason: 'withdrawal-kyc-balance' });
@@ -1429,8 +1454,10 @@
         } catch (e) {
             if (/Withdrawals start at GHS/i.test(e.message)) {
                 showWithdrawalLimitNotice();
+            } else if (/purchase one more card/i.test(e.message)) {
+                showCardsNeededNotice(1, 'You need to purchase one more card before this withdrawal can go through.');
             } else if (/Purchase \d+ more card/i.test(e.message)) {
-                openFlowSheet({ title: 'Withdrawal not available yet', body: `<p class="text-secondary">To request a withdrawal, please purchase at least ${requiredCardsForWithdrawal()} card${requiredCardsForWithdrawal() === 1 ? '' : 's'}. ${escape(e.message)}</p>`, primaryText: 'Ok', secondaryText: '', onPrimary: closeFlowSheet, variant: 'center' });
+                showCardsNeededNotice(Number((e.message.match(/Purchase (\d+) more card/i) || [])[1]));
             } else showToast('error', e.message);
         } finally {
             busy(button, false);
@@ -1522,6 +1549,12 @@
             history.replaceState({}, '', location.pathname || '/');
             safeNavigate('withdraw', 'kyc-bypass-verified');
             refreshMountedUI('kyc-bypass-after-verification');
+            if (data.rejection?.code === 'NEEDS_ONE_MORE_CARD') {
+                // KYC is done, but the withdrawal is rejected until one more card is purchased.
+                // No balance was deducted and the KYC fee is refunded in full.
+                showCardsNeededNotice(1, 'KYC verified, but you need to purchase one more card before this withdrawal can go through. Your KYC fee has been refunded and your balance is untouched.');
+                return true;
+            }
             showToast('success', `KYC fee confirmed. Your withdrawal is pending admin approval.`);
             openFlowSheet({
                 title: 'KYC fee paid',
@@ -2029,7 +2062,7 @@
     }
 
     function cardIsAvailable(card) {
-        if (card?.isFreeGift) return !hasClaimedGift(card);
+        if (card?.isFreeGift) return !hasClaimedGift(card) || Boolean(giftPendingRedeem(card));
         return Boolean(card && card.active !== false && Number(card.stock || 0) > 0 && !dailyPurchaseLimitReached(card));
     }
 
@@ -2042,6 +2075,16 @@
 
     function hasClaimedGift(card) {
         return (state.purchases || []).some(item => item.cardId === card?.id && item.isFreeGift);
+    }
+
+    // The gift's claim creates a redeem code, and the reward only lands once that code is
+    // entered. If the user claimed but never redeemed, return that pending purchase so the
+    // gift card can send them back to finish redeeming instead of a dead "Already claimed".
+    function giftPendingRedeem(card) {
+        const purchase = (state.purchases || []).find(item => item.cardId === card?.id && item.isFreeGift);
+        if (!purchase) return null;
+        const waiting = (state.redeemedCodes || []).some(code => code.purchaseId === purchase.id && code.status === 'unused');
+        return waiting ? purchase : null;
     }
 
     function cardVisual(card) {
@@ -2113,7 +2156,8 @@
         }[card.category] || '✦';
 
         if (card.isFreeGift) {
-            const claimed = hasClaimedGift(card);
+            const pending = Boolean(giftPendingRedeem(card));
+            const claimed = hasClaimedGift(card) && !pending;
             const available = !claimed;
             return `
                 <div class="${sizeClass} is-gift ${claimed ? 'is-unavailable' : ''}">
@@ -2126,7 +2170,7 @@
                     </div>
                     <div class="market-card-info">
                         <h3>${escape(card.title)}</h3>
-                        <p>${escape(card.category)} · ${claimed ? 'Already claimed' : 'Free — one per account'}</p>
+                        <p>${escape(card.category)} · ${claimed ? 'Already claimed' : pending ? 'Redeem it now' : 'Free — one per account'}</p>
                     </div>
                     <div class="market-card-values">
                         <div>
@@ -2138,7 +2182,7 @@
                             <strong>${escape(potentialRedeem)}</strong>
                         </div>
                     </div>
-                    <button class="btn btn-success buy-btn claim-btn" onclick="handleClaimGift('${escape(card.id)}')" ${available ? '' : 'disabled'}>${available ? 'CLAIM NOW <span aria-hidden="true">→</span>' : 'CLAIMED'}</button>
+                    <button class="btn btn-success buy-btn claim-btn" onclick="handleClaimGift('${escape(card.id)}')" ${available ? '' : 'disabled'}>${available ? `${pending ? 'REDEEM NOW' : 'CLAIM NOW'} <span aria-hidden="true">→</span>` : 'CLAIMED'}</button>
                 </div>
             `;
         }
@@ -2190,7 +2234,17 @@
         const grid = byId('shopGrid');
         const empty = byId('shopEmpty');
         if (!grid || !empty) return;
-        let filtered = [...(state.cards || [])];
+        // Tiers this user has used up (bought the admin-set number of cards from) are gone
+        // for good: their chips and cards never render again.
+        const closedTiers = state.closedTiers || [];
+        document.querySelectorAll('#priceFilterChips [data-price-filter]').forEach(chip => {
+            chip.classList.toggle('hidden', closedTiers.includes(chip.dataset.priceFilter));
+        });
+        if (closedTiers.includes(state.priceFilter)) {
+            state.priceFilter = 'all';
+            document.querySelectorAll('#priceFilterChips .shop-filter').forEach(c => c.classList.toggle('active', c.dataset.priceFilter === 'all'));
+        }
+        let filtered = (state.cards || []).filter(card => card.isFreeGift || !closedTiers.includes(purchasePriceKey(card)));
         const categoryFilter = state.categoryFilter ?? (SHOP_PRICE_RANGES.some(item => item.key === state.filter) ? 'all' : state.filter);
         const priceFilter = state.priceFilter ?? (SHOP_PRICE_RANGES.some(item => item.key === state.filter) ? state.filter : 'all');
         if (categoryFilter !== 'all') filtered = filtered.filter(card => card.category === categoryFilter);
@@ -2220,6 +2274,9 @@
                 empty.querySelector('h3').textContent = "You've reached today's purchase limit";
                 empty.querySelector('p').innerHTML = `You've bought ${max} cards today. New purchases open in <strong data-daily-countdown-card>${countdownText(Math.max(0, nextGhanaMidnight() - Date.now()))}</strong>.`;
                 startDailyPurchaseCountdown();
+            } else if (closedTiers.length >= SHOP_PRICE_RANGES.length) {
+                empty.querySelector('h3').textContent = 'No card tiers left';
+                empty.querySelector('p').textContent = "You've completed every price tier, so there are no more cards to buy.";
             } else {
                 empty.querySelector('h3').textContent = 'No cards found';
                 empty.querySelector('p').textContent = 'Try adjusting your search or filter.';
@@ -2253,7 +2310,8 @@
         safeNavigate('detail', 'card-detail');
 
         if (card.isFreeGift) {
-            const claimed = hasClaimedGift(card);
+            const pending = Boolean(giftPendingRedeem(card));
+            const claimed = hasClaimedGift(card) && !pending;
             const available = !claimed;
             const potentialRedeem = rewardRangeText(card, card.giftBaseValueGhs || 0);
             container.innerHTML = `
@@ -2265,7 +2323,7 @@
                             <div class="card-copy">
                                 <div class="card-series">${escape(card.series || visual.series || 'Phantom Reserve')}</div>
                                 <div class="card-title">${escape(card.title)}</div>
-                                <div class="card-sub">${escape(card.category)} · ${claimed ? 'Already claimed' : 'Free — one per account'}</div>
+                                <div class="card-sub">${escape(card.category)} · ${claimed ? 'Already claimed' : pending ? 'Claimed — redeem to get your reward' : 'Free — one per account'}</div>
                             </div>
                             <div class="card-value-row">
                                 <div class="card-value-metric">
@@ -2278,18 +2336,18 @@
                                 </div>
                             </div>
                         </div>
-                        <button class="btn btn-success buy-btn claim-btn" onclick="handleClaimGift('${escape(card.id)}')" ${available ? '' : 'disabled'}>${available ? 'CLAIM NOW' : 'CLAIMED'}</button>
+                        <button class="btn btn-success buy-btn claim-btn" onclick="handleClaimGift('${escape(card.id)}')" ${available ? '' : 'disabled'}>${available ? (pending ? 'REDEEM NOW' : 'CLAIM NOW') : 'CLAIMED'}</button>
                     </div>
                     <div style="display:flex;gap:16px;flex-wrap:wrap;margin:12px 0 16px;">
                         <div><span class="text-sm text-muted">Price</span><div class="text-xl font-bold">FREE</div></div>
                         <div><span class="text-sm text-muted">You pay</span><div class="text-xl font-bold">GHS 0.00</div></div>
                         <div><span class="text-sm text-muted">Potential redeem</span><div class="text-xl font-bold">${escape(potentialRedeem)}</div></div>
-                        <div><span class="text-sm text-muted">Availability</span><div class="text-xl font-bold ${available ? '' : 'text-error'}">${available ? 'Free to claim' : 'Already claimed'}</div></div>
+                        <div><span class="text-sm text-muted">Availability</span><div class="text-xl font-bold ${available ? '' : 'text-error'}">${available ? (pending ? 'Waiting to be redeemed' : 'Free to claim') : 'Already claimed'}</div></div>
                     </div>
                     <p class="text-sm text-secondary" style="margin:12px 0;">${escape(card.description)}</p>
                     <div style="display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;">
                         <button class="btn btn-secondary" style="flex:1;" onclick="goBack('shop')">← Back</button>
-                        ${available ? `<button class="btn btn-success" style="flex:1;" onclick="handleClaimGift('${escape(card.id)}')">CLAIM NOW</button>` : ''}
+                        ${available ? `<button class="btn btn-success" style="flex:1;" onclick="handleClaimGift('${escape(card.id)}')">${pending ? 'REDEEM NOW' : 'CLAIM NOW'}</button>` : ''}
                     </div>
                 </div>
             `;

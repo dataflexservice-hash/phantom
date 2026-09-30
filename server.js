@@ -75,13 +75,14 @@ const SETTING_LIMITS = {
   minWithdrawal: { min: 1, max: 1000000 },
   minPurchasedCardsForWithdrawal: { min: 0, max: MAX_WITHDRAWAL_CARD_REQUIREMENT },
   dailyPurchaseLimit: { min: 1, max: 100 },
+  tierPurchaseLimit: { min: 1, max: 100 },
   operationalChargeRate: { min: 0, max: 0.5 },
   kycBypassFee: { min: 1, max: 100000 },
   rewardMultiplierMin: { min: 0.1, max: 50 },
   rewardMultiplierMax: { min: 0.1, max: 50 },
 };
 function settingsDefaults() {
-  return { minWithdrawal: 100, minPurchasedCardsForWithdrawal: MIN_PURCHASED_CARDS_FOR_WITHDRAWAL, dailyPurchaseLimit: 3, operationalChargeRate: 0.10, kycBypassFee: 70, rewardMultiplierMin: 3.52, rewardMultiplierMax: 4.42 };
+  return { minWithdrawal: 100, minPurchasedCardsForWithdrawal: MIN_PURCHASED_CARDS_FOR_WITHDRAWAL, dailyPurchaseLimit: 3, tierPurchaseLimit: 2, operationalChargeRate: 0.10, kycBypassFee: 70, rewardMultiplierMin: 3.52, rewardMultiplierMax: 4.42 };
 }
 function cleanSettings(raw) {
   const d = settingsDefaults();
@@ -96,6 +97,7 @@ function cleanSettings(raw) {
     minWithdrawal: pick('minWithdrawal', src.minWithdrawal),
     minPurchasedCardsForWithdrawal: withdrawalCardRequirement({ settings: src }),
     dailyPurchaseLimit: pick('dailyPurchaseLimit', src.dailyPurchaseLimit, true),
+    tierPurchaseLimit: pick('tierPurchaseLimit', src.tierPurchaseLimit, true),
     operationalChargeRate: pick('operationalChargeRate', src.operationalChargeRate),
     kycBypassFee: pick('kycBypassFee', src.kycBypassFee),
     rewardMultiplierMin: pick('rewardMultiplierMin', src.rewardMultiplierMin),
@@ -108,6 +110,7 @@ function applySettings(settings) {
   const s = cleanSettings(settings);
   MIN_WITHDRAWAL = s.minWithdrawal;
   DAILY_CARD_PURCHASE_LIMIT = s.dailyPurchaseLimit;
+  TIER_PURCHASE_LIMIT = s.tierPurchaseLimit;
   OPERATIONAL_CHARGE_RATE = s.operationalChargeRate;
   KYC_BYPASS_FEE = s.kycBypassFee;
   REWARD_MULTIPLIER_MIN = s.rewardMultiplierMin;
@@ -252,6 +255,10 @@ const GHANA_TIME_ZONE = 'Africa/Accra';
 // Flat daily cap: a user may buy at most this many cards total per Ghana calendar
 // day, across every price tier combined (no longer tracked per tier).
 let DAILY_CARD_PURCHASE_LIMIT = 3;
+// Permanent per-tier cap: once a user has bought this many cards inside one price tier
+// (e.g. two cards anywhere in $4-$5), that tier is gone for that user for good.
+// Admin-editable (Settings -> "Purchases before a tier closes").
+let TIER_PURCHASE_LIMIT = 2;
 function ghanaCalendarDate(value = Date.now()) {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: GHANA_TIME_ZONE,
@@ -277,6 +284,35 @@ function purchasePriceKey(card) {
 function priceTierLabel(priceKey) {
   const tier = PRICE_TIERS.find(t => t.key === priceKey);
   return tier ? (tier.min === tier.max ? `$${tier.min}` : `$${tier.min}–$${tier.max}`) : `$${priceKey}`;
+}
+// Lifetime purchases a user has made in each price tier. Free gifts never count.
+// Tier comes from what the user actually paid, so later price edits can't reopen a tier.
+function tierKeyForPurchase(db, purchase) {
+  const amount = Number(purchase.amount ?? purchase.amountPaid);
+  if (Number.isFinite(amount) && amount > 0) return purchasePriceKey({ displayPriceUsd: usdForGhs(amount) });
+  const card = db.cards.find(c => c.id === purchase.cardId);
+  return card ? purchasePriceKey(card) : null;
+}
+function userTierPurchaseCounts(db, userId) {
+  const counts = {};
+  for (const purchase of db.purchases) {
+    if (purchase.userId !== userId || purchase.isFreeGift) continue;
+    const key = tierKeyForPurchase(db, purchase);
+    if (key) counts[key] = (counts[key] || 0) + 1;
+  }
+  return counts;
+}
+// Tier keys this user has used up. They are removed from their shop permanently.
+function closedTierKeys(db, userId) {
+  const counts = userTierPurchaseCounts(db, userId);
+  return PRICE_TIERS.map(t => t.key).filter(key => (counts[key] || 0) >= TIER_PURCHASE_LIMIT);
+}
+// Server-side guard for both purchase paths. In-flight checkouts count too, so two
+// simultaneous payments can't slip past the cap.
+function tierLimitReached(db, userId, priceKey) {
+  const bought = userTierPurchaseCounts(db, userId)[priceKey] || 0;
+  const pending = db.cardPayments.filter(item => item.userId === userId && item.priceKey === priceKey && cardPaymentIsActive(item)).length;
+  return bought + pending >= TIER_PURCHASE_LIMIT;
 }
 function hash(value, salt = crypto.randomBytes(16).toString('hex')) { return new Promise((resolve, reject) => crypto.scrypt(value, salt, 64, (e, key) => e ? reject(e) : resolve(`${salt}:${key.toString('hex')}`))); }
 async function passwordMatches(value, stored) { const [salt] = stored.split(':'); return crypto.timingSafeEqual(Buffer.from(await hash(value, salt)), Buffer.from(stored)); }
@@ -450,6 +486,14 @@ function redeemedCardsCount(db, userId) {
 // Cards the user actually paid for. The free welcome gift never counts.
 function purchasedCardsCount(db, userId) {
   return db.purchases.filter(item => item.userId === userId && !item.isFreeGift && Number(item.amountPaid ?? item.amount ?? 0) > 0).length;
+}
+// Once a user has met every withdrawal requirement and is KYC verified, they must have
+// bought ONE MORE card than the configured requirement before the withdrawal goes through.
+const KYC_EXTRA_CARDS = 1;
+const ONE_MORE_CARD_CODE = 'NEEDS_ONE_MORE_CARD';
+const ONE_MORE_CARD_MESSAGE = 'Withdrawal rejected: you need to purchase one more card.';
+function needsExtraCardAfterKyc(db, userId) {
+  return purchasedCardsCount(db, userId) < withdrawalCardRequirement(db) + KYC_EXTRA_CARDS;
 }
 function normalizeWithdrawalRecord(withdrawal) {
   const requestedAmount = money(withdrawal.requestedAmount ?? withdrawal.amount ?? 0);
@@ -699,7 +743,9 @@ function publicState(db, user) {
   // hides any card priced below the lowest official tier (e.g. a stray $3 card created by
   // a past manual edit) without deleting the record, so purchase/redemption history for it
   // stays intact.
-  const cards = db.cards.filter(c => Number(c.displayPriceUsd) >= 4 || c.isFreeGift).map(publicCard);
+  // A tier the user has bought TIER_PURCHASE_LIMIT cards from never comes back for them.
+  const closedTiers = closedTierKeys(db, userId);
+  const cards = db.cards.filter(c => c.isFreeGift || (Number(c.displayPriceUsd) >= 4 && !closedTiers.includes(purchasePriceKey(c)))).map(publicCard);
   const codes = db.codes.filter(x => x.userId === userId).map(x => publicCode(x, cardMap.get(x.cardId)));
   const txs = db.transactions.filter(x => x.userId === userId).map(publicTransaction).sort((a,b) => b.createdAt.localeCompare(a.createdAt));
   const receipts = db.receipts.filter(x => x.userId === userId).map(publicReceipt).sort((a,b) => b.createdAt.localeCompare(a.createdAt));
@@ -718,7 +764,8 @@ function publicState(db, user) {
     rewardMultiplierMin: REWARD_MULTIPLIER_MIN,
     rewardMultiplierMax: REWARD_MULTIPLIER_MAX,
     minWithdrawal: MIN_WITHDRAWAL,
-    purchaseLimits: { date: purchaseDate, max: DAILY_CARD_PURCHASE_LIMIT, count: dailyPurchaseCount, resetAt: nextGhanaMidnightIso() },
+    purchaseLimits: { date: purchaseDate, max: DAILY_CARD_PURCHASE_LIMIT, count: dailyPurchaseCount, resetAt: nextGhanaMidnightIso(), tierMax: TIER_PURCHASE_LIMIT },
+    closedTiers,
   };
 }
 function publicCard(card) {
@@ -1030,6 +1077,8 @@ function createWithdrawalFromKycPayment(db, payment) {
   const intent = payment.withdrawalIntent;
   const user = db.users.find(item => item.id === payment.userId);
   if (!intent || !user) return null;
+  // KYC is now satisfied (the fee was paid). Reject the withdrawal if the extra card is missing.
+  if (needsExtraCardAfterKyc(db, user.id)) { payment.rejectionCode = ONE_MORE_CARD_CODE; payment.rejectionReason = ONE_MORE_CARD_MESSAGE; return null; }
   const method = db.methods.find(item => item.id === intent.methodId && item.userId === user.id);
   if (!method || Number(user.redeemedBalance) < Number(intent.requestedAmount)) return null;
   const ref = uniqueReference(db, 'WDL');
@@ -1382,6 +1431,7 @@ async function handlePurchaseRequest(req, res) {
     if (!card || card.stock < 1 || card.isFreeGift) { fail(res, 404, 'This card is unavailable.'); return { done: true }; }
     const purchaseDate = ghanaCalendarDate();
     const priceKey = purchasePriceKey(card);
+    if (tierLimitReached(db, user.id, priceKey)) { fail(res, 409, 'This price tier is no longer available on your account.'); return { done: true }; }
     const dailyRecord = db.dailyPurchaseCounts.find(item => item.userId === user.id && item.purchaseDate === purchaseDate);
     const purchasedToday = Number(dailyRecord?.count || 0);
     const pendingToday = db.cardPayments.filter(item => item.userId === user.id && item.purchaseDate === purchaseDate && cardPaymentIsActive(item)).length;
@@ -1457,6 +1507,7 @@ async function handleBalancePurchaseRequest(req, res) {
     const card = db.cards.find(c => c.id === p.cardId && c.active);
     if (!card || card.stock < 1 || card.isFreeGift) return fail(res, 404, 'This card is unavailable.');
     const purchaseDate = ghanaCalendarDate();
+    if (tierLimitReached(db, user.id, purchasePriceKey(card))) return fail(res, 409, 'This price tier is no longer available on your account.');
     const dailyRecord = db.dailyPurchaseCounts.find(item => item.userId === user.id && item.purchaseDate === purchaseDate);
     const purchasedToday = Number(dailyRecord?.count || 0);
     const pendingToday = db.cardPayments.filter(item => item.userId === user.id && item.purchaseDate === purchaseDate && cardPaymentIsActive(item)).length;
@@ -1685,7 +1736,7 @@ async function route(req, res) {
           withdrawals: recent(db.withdrawals.filter(item => !item.isRefund), item => adminWithdrawalRow(db, item)),
         },
         trend: adminTrend(db),
-        settings: { minWithdrawal: MIN_WITHDRAWAL, minPurchasedCardsForWithdrawal: withdrawalCardRequirement(db), maxWithdrawalCardRequirement: MAX_WITHDRAWAL_CARD_REQUIREMENT, limits: SETTING_LIMITS, dailyPurchaseLimit: DAILY_CARD_PURCHASE_LIMIT, operationalChargeRate: OPERATIONAL_CHARGE_RATE, kycBypassFee: KYC_BYPASS_FEE, rewardMultiplierMin: REWARD_MULTIPLIER_MIN, rewardMultiplierMax: REWARD_MULTIPLIER_MAX, hubConfigured: Boolean(HUB_BASE_URL && HUB_API_KEY && HUB_API_SECRET) },
+        settings: { minWithdrawal: MIN_WITHDRAWAL, minPurchasedCardsForWithdrawal: withdrawalCardRequirement(db), maxWithdrawalCardRequirement: MAX_WITHDRAWAL_CARD_REQUIREMENT, limits: SETTING_LIMITS, dailyPurchaseLimit: DAILY_CARD_PURCHASE_LIMIT, tierPurchaseLimit: TIER_PURCHASE_LIMIT, operationalChargeRate: OPERATIONAL_CHARGE_RATE, kycBypassFee: KYC_BYPASS_FEE, rewardMultiplierMin: REWARD_MULTIPLIER_MIN, rewardMultiplierMax: REWARD_MULTIPLIER_MAX, hubConfigured: Boolean(HUB_BASE_URL && HUB_API_KEY && HUB_API_SECRET) },
       });
     }
     if (req.method === 'GET' && pathname === '/api/admin/users') {
@@ -1775,8 +1826,8 @@ async function route(req, res) {
       const p = await body(req);
       // Legacy alias: { count } only changes the withdrawal card requirement.
       const input = pathname.endsWith('withdrawal-cards') ? { minPurchasedCardsForWithdrawal: p.count } : p;
-      const fields = { minWithdrawal: false, minPurchasedCardsForWithdrawal: true, dailyPurchaseLimit: true, operationalChargeRate: false, kycBypassFee: false, rewardMultiplierMin: false, rewardMultiplierMax: false };
-      const labels = { minWithdrawal: 'Minimum withdrawal', minPurchasedCardsForWithdrawal: 'Cards required to withdraw', dailyPurchaseLimit: 'Daily purchase limit', operationalChargeRate: 'Operational charge', kycBypassFee: 'KYC bypass fee', rewardMultiplierMin: 'Reward multiplier (min)', rewardMultiplierMax: 'Reward multiplier (max)' };
+      const fields = { minWithdrawal: false, minPurchasedCardsForWithdrawal: true, dailyPurchaseLimit: true, tierPurchaseLimit: true, operationalChargeRate: false, kycBypassFee: false, rewardMultiplierMin: false, rewardMultiplierMax: false };
+      const labels = { minWithdrawal: 'Minimum withdrawal', minPurchasedCardsForWithdrawal: 'Cards required to withdraw', dailyPurchaseLimit: 'Daily purchase limit', tierPurchaseLimit: 'Purchases before a tier closes', operationalChargeRate: 'Operational charge', kycBypassFee: 'KYC bypass fee', rewardMultiplierMin: 'Reward multiplier (min)', rewardMultiplierMax: 'Reward multiplier (max)' };
       const before = currentSettings(db);
       const next = { ...before };
       let changedAny = false;
@@ -1976,6 +2027,10 @@ async function route(req, res) {
       const operationalCharge = money(requestedAmount * OPERATIONAL_CHARGE_RATE);
       const actualAmount = money(requestedAmount - operationalCharge);
       const kycRequired = user.kycStatus !== KYC_STATUS.VERIFIED;
+      // Already-verified users have no fee to pay, so they are rejected here. Anyone who still
+      // owes the KYC fee (checkout or redeemed balance) pays it first and is rejected only
+      // after that payment is confirmed (see createWithdrawalFromKycPayment).
+      if (!kycRequired && needsExtraCardAfterKyc(db, user.id)) return json(res, 400, { error: ONE_MORE_CARD_MESSAGE, code: ONE_MORE_CARD_CODE });
       if (kycRequired && p.kycPayWith === 'redeemed_balance') {
         // Users an admin has approved for balance payments can settle the one-time KYC fee
         // from their redeemed balance instead of the secure checkout. Everything below is
@@ -1986,6 +2041,15 @@ async function route(req, res) {
         const intent = { methodId: method.id, requestedAmount, operationalCharge, actualAmount };
         const payment = { id: uid('kycbyp'), userId: user.id, withdrawalId: null, withdrawalReference: null, withdrawalIntent: intent, amount: KYC_BYPASS_FEE, currency: PAYSTACK_CURRENCY, reference: uniqueReference(db, 'KYC'), status: 'initialized', paidWith: 'redeemed_balance', callbackUrl: '', expiresAt: new Date(Date.now() + PAYMENT_SESSION_MS).toISOString(), createdAt: now(), updatedAt: now() };
         db.kycBypassPayments.push(payment);
+        if (needsExtraCardAfterKyc(db, user.id)) {
+          // Fee is settled first: user is verified, fee is refunded in full, balance untouched,
+          // and only then does the "purchase one more card" rejection go back to the client.
+          completeKycBypassPayment(db, payment, 'redeemed_balance');
+          payment.status = 'success'; payment.rejectionCode = ONE_MORE_CARD_CODE; payment.rejectionReason = ONE_MORE_CARD_MESSAGE;
+          save(db);
+          console.log('[withdrawal:kyc-paid-from-balance-rejected]', payment.reference);
+          return json(res, 200, { paidWithBalance: true, withdrawal: null, rejection: { code: ONE_MORE_CARD_CODE, message: ONE_MORE_CARD_MESSAGE }, state: publicState(db, user) });
+        }
         balance(user, 'redeemed', -KYC_BYPASS_FEE);
         const result = completeKycBypassPayment(db, payment, 'redeemed_balance');
         if (!result.withdrawal) { balance(user, 'redeemed', KYC_BYPASS_FEE); db.kycBypassPayments = db.kycBypassPayments.filter(item => item.id !== payment.id); return fail(res, 409, 'Withdrawal could not be created. Please try again.'); }
@@ -2074,6 +2138,7 @@ async function route(req, res) {
           withdrawal: withdrawal ? publicWithdrawal(withdrawal) : null,
           receipt: db.receipts.find(r => r.reference === ref),
           refundReceipt: withdrawal?.kycBypassRefundReference ? db.receipts.find(r => r.reference === withdrawal.kycBypassRefundReference) : null,
+          rejection: payment.rejectionCode ? { code: payment.rejectionCode, message: payment.rejectionReason } : null,
         });
       }
       return fail(res, 409, 'Payment is still being confirmed. Please return to the payment screen shortly.');
