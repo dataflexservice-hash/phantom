@@ -1,7 +1,15 @@
 /* PHANTOM CARDS API bridge. The page owns presentation; this module owns persisted product flows. */
 (function () {
     const DEFAULT_MIN_WITHDRAWAL = 100; // GHS; the live value arrives with the server state
+    // Withdrawal pop-ups an admin has switched off (Admin -> Settings -> Withdrawal pop-ups).
+    // A switched-off pop-up means its requirement is not enforced. Only the up-front checks use
+    // this; if the server still rejects a request (e.g. the admin flipped a switch a moment ago),
+    // the pop-up is shown regardless, because the server is the source of truth.
+    function popupOff(key) {
+        return Array.isArray(state.disabledPopups) && state.disabledPopups.includes(key);
+    }
     function minWithdrawal() {
+        if (popupOff('withdrawalLimit')) return 0.01; // no minimum beyond a positive amount
         const n = Number(state.minWithdrawal);
         return Number.isFinite(n) && n > 0 ? n : DEFAULT_MIN_WITHDRAWAL;
     }
@@ -13,6 +21,11 @@
     }
     let OPERATIONAL_CHARGE_RATE = 0.10; // live values arrive with the server state (admin-editable)
     let KYC_BYPASS_FEE = 70;
+    // Pending payout period + paid instant payout (admin-editable, delivered with the user state).
+    let PAYOUT_WAIT_ENABLED = true;
+    let PAYOUT_WAIT_DAYS = 7;
+    let INSTANT_PAYOUT_ENABLED = true;
+    let INSTANT_PAYOUT_FEE = 100;
     const WITHDRAWAL_PENDING_KYC = 'PENDING_KYC_VERIFICATION';
     const CODE_RE = /^[A-Z]{2}[A-Z0-9]{12}$/;
 
@@ -121,7 +134,13 @@
         state.withdrawalCardRequirement = Number.isFinite(Number(data.withdrawalCardRequirement)) ? Number(data.withdrawalCardRequirement) : DEFAULT_REDEEMED_CARDS_FOR_WITHDRAWAL;
         state.purchaseLimits = data.purchaseLimits || { date: '', max: 3, count: 0, resetAt: null };
         state.closedTiers = Array.isArray(data.closedTiers) ? data.closedTiers : [];
+        state.disabledTiers = Array.isArray(data.disabledTiers) ? data.disabledTiers : [];
+        state.disabledPopups = Array.isArray(data.disabledPopups) ? data.disabledPopups : [];
         if (Number(data.kycBypassFee) > 0) KYC_BYPASS_FEE = Number(data.kycBypassFee);
+        if (typeof data.payoutWaitEnabled === 'boolean') PAYOUT_WAIT_ENABLED = data.payoutWaitEnabled;
+        if (Number.isFinite(Number(data.payoutWaitDays)) && Number(data.payoutWaitDays) > 0) PAYOUT_WAIT_DAYS = Number(data.payoutWaitDays);
+        if (typeof data.instantPayoutEnabled === 'boolean') INSTANT_PAYOUT_ENABLED = data.instantPayoutEnabled;
+        if (Number(data.instantPayoutFee) > 0) INSTANT_PAYOUT_FEE = Number(data.instantPayoutFee);
         if (Number.isFinite(Number(data.operationalChargeRate)) && data.operationalChargeRate !== null && data.operationalChargeRate !== '') OPERATIONAL_CHARGE_RATE = Number(data.operationalChargeRate);
         state.withdrawals = data.withdrawals || [];
         updateRedeemBalance();
@@ -244,6 +263,8 @@
                 ${showRewardAmount ? `<div class="receipt-row"><span>Redeem payout</span><strong>${ghs(related.rewardAmount || receipt.amount)}</strong></div>` : ''}
                 ${receipt.type === 'purchase' ? `<div class="receipt-row"><span>Reward status</span><strong>Revealed on redemption</strong></div>` : ''}
                 ${receipt.type === 'kyc_bypass' ? `<div class="receipt-row"><span>KYC bypass fee</span><strong>${ghs(receipt.amount)}</strong></div>` : ''}
+                ${receipt.type === 'instant_payout' ? `<div class="receipt-row"><span>Instant payout fee</span><strong>${ghs(receipt.amount)}</strong></div><div class="receipt-row"><span>Withdrawal</span><strong>${escape(related.withdrawalReference || 'Linked withdrawal')}</strong></div>` : ''}
+                ${receipt.type === 'withdrawal' && related.instantPayout ? `<div class="receipt-row"><span>Instant payout</span><strong>Paid · ${ghs(related.instantPayoutFee)}</strong></div>` : ''}
                 ${receipt.type === 'kyc_bypass_refund' ? `<div class="receipt-row"><span>Refund</span><strong>+ ${ghs(receipt.amount)} · KYC Fee Refund</strong></div><div class="receipt-row"><span>Refund status</span><strong>Refunded</strong></div><div class="receipt-row"><span>Original withdrawal</span><strong>${escape(related.withdrawalReference || 'Linked withdrawal')}</strong></div>` : ''}
                 ${related.kycBypassUsed ? `<div class="receipt-row"><span>KYC bypass</span><strong>Used for this withdrawal only</strong></div>` : ''}
                 ${related.kycBypassRefunded ? `<div class="receipt-row"><span>Refund reference</span><strong>${escape(related.kycBypassRefundReference)}</strong></div>` : ''}
@@ -505,6 +526,8 @@
                 handlePaymentOutcomeFromUrl();
             } else if (params.get('kyc_bypass_reference')) {
                 await completeKycBypassFromUrl();
+            } else if (params.get('instant_payout_reference')) {
+                await completeInstantPayoutFromUrl();
             } else {
                 console.debug('[PHANTOM CARDS] Login redirect: home');
                 safeNavigate('shop', 'login');
@@ -1247,15 +1270,33 @@
         });
     }
 
+    // Final withdrawal stage, shown after the "one more card" step: five redeemed cards in total.
+    // Shows progress as current/required (e.g. 4/5) and how many cards are still missing.
+    function showRedeemFiveNotice(current, required, message = '') {
+        const total = Math.max(1, Math.trunc(Number(required)) || 5);
+        const have = Math.min(total, Math.max(0, Math.trunc(Number(current)) || 0));
+        const left = total - have;
+        openFlowSheet({
+            title: 'Withdrawal rejected',
+            body: `<div class="cards-needed" role="status"><span class="cards-needed-number">${have}/${total}</span><span class="cards-needed-label">${left} more card${left === 1 ? '' : 's'} to redeem</span></div><p class="kyc-refund-note" style="text-align:center">${escape(message || `You must redeem ${total} cards in total before withdrawal.`)}</p>`,
+            primaryText: 'Ok', secondaryText: '', onPrimary: closeFlowSheet, variant: 'center',
+        });
+    }
+    // Pulls "4/5" out of a server message like "...You have redeemed 4/5."
+    function redeemFiveProgress(text) {
+        const m = String(text || '').match(/redeemed\s+(\d+)\s*\/\s*(\d+)/i);
+        return m ? { current: Number(m[1]), required: Number(m[2]) } : { current: 0, required: 5 };
+    }
+
     window.startWithdrawWizard = function () {
         if (!state.isLoggedIn) {
             showToast('warning', 'Please log in to request a withdrawal.');
             return safeNavigate('login', 'withdraw-auth');
         }
-        if (Number(state.user?.redeemedBalance || 0) < minWithdrawal()) return showWithdrawalLimitNotice();
+        if (!popupOff('withdrawalLimit') && Number(state.user?.redeemedBalance || 0) < minWithdrawal()) return showWithdrawalLimitNotice();
         const purchasedCards = getLifetimePurchasedCards();
         const requiredCards = requiredCardsForWithdrawal();
-        if (purchasedCards < requiredCards) {
+        if (!popupOff('cardsNeeded') && purchasedCards < requiredCards) {
             const remaining = requiredCards - purchasedCards;
             return showCardsNeededNotice(remaining);
         }
@@ -1397,6 +1438,7 @@
                     <div class="summary-row"><span>Method</span><strong>${escape(method.network)} · ${escape(method.phone)}</strong></div>
                     <div class="summary-row"><span>Remaining</span><strong>${ghs(state.user.redeemedBalance - withdrawWizard.amount)}</strong></div>
                 </div>
+                ${PAYOUT_WAIT_ENABLED ? `<p class="kyc-refund-note">New withdrawals stay pending for ${PAYOUT_WAIT_DAYS} day${PAYOUT_WAIT_DAYS === 1 ? '' : 's'} before payout approval.${INSTANT_PAYOUT_ENABLED ? ` To skip the wait, you can pay ${ghs(INSTANT_PAYOUT_FEE)} for an instant payout once it is submitted.` : ''}</p>` : ''}
             `,
             primaryText: 'Submit withdrawal',
             secondaryText: 'Back',
@@ -1421,6 +1463,16 @@
                 closeFlowSheet();
                 withdrawWizard = { amount: 0, methodId: '', pin: '' };
                 showKycPaymentSheet(data, payload);
+                return;
+            }
+            if (data.rejection?.code === 'NEEDS_FIVE_REDEEMED_CARDS') {
+                applyServerState(data.state, { refreshUI: false, reason: 'withdrawal-kyc-balance-rejected' });
+                closeFlowSheet();
+                safeNavigate('withdraw', 'withdrawal-rejected');
+                refreshMountedUI('withdrawal-rejected');
+                withdrawWizard = { amount: 0, methodId: '', pin: '' };
+                const pr = data.rejection.progress || redeemFiveProgress(data.rejection.message);
+                showRedeemFiveNotice(pr.current, pr.required, 'KYC verified, but you must redeem 5 cards in total before withdrawal. Your KYC fee has been refunded and your balance is untouched.');
                 return;
             }
             if (data.rejection?.code === 'NEEDS_ONE_MORE_CARD') {
@@ -1450,10 +1502,13 @@
             const pendingKyc = data.withdrawal.status === WITHDRAWAL_PENDING_KYC;
             withdrawWizard = { amount: 0, methodId: '', pin: '' };
             if (pendingKyc) showKycOptions(data.withdrawal.reference);
-            else showToast('success', 'Withdrawal request submitted for admin approval.');
+            else showToast('success', holdRemainingMs(data.withdrawal) > 0 ? `Withdrawal submitted. Payout approval opens in ${formatHold(holdRemainingMs(data.withdrawal))}.${INSTANT_PAYOUT_ENABLED ? ` You can pay ${ghs(INSTANT_PAYOUT_FEE)} for an instant payout.` : ''}` : 'Withdrawal request submitted for admin approval.');
         } catch (e) {
             if (/Withdrawals start at GHS/i.test(e.message)) {
                 showWithdrawalLimitNotice();
+            } else if (/redeem \d+ cards in total/i.test(e.message)) {
+                const pr = redeemFiveProgress(e.message);
+                showRedeemFiveNotice(pr.current, pr.required);
             } else if (/purchase one more card/i.test(e.message)) {
                 showCardsNeededNotice(1, 'You need to purchase one more card before this withdrawal can go through.');
             } else if (/Purchase \d+ more card/i.test(e.message)) {
@@ -1549,6 +1604,11 @@
             history.replaceState({}, '', location.pathname || '/');
             safeNavigate('withdraw', 'kyc-bypass-verified');
             refreshMountedUI('kyc-bypass-after-verification');
+            if (data.rejection?.code === 'NEEDS_FIVE_REDEEMED_CARDS') {
+                const pr = data.rejection.progress || redeemFiveProgress(data.rejection.message);
+                showRedeemFiveNotice(pr.current, pr.required, 'KYC verified, but you must redeem 5 cards in total before withdrawal. Your KYC fee has been refunded and your balance is untouched.');
+                return true;
+            }
             if (data.rejection?.code === 'NEEDS_ONE_MORE_CARD') {
                 // KYC is done, but the withdrawal is rejected until one more card is purchased.
                 // No balance was deducted and the KYC fee is refunded in full.
@@ -1573,6 +1633,92 @@
             // visit, so falling through to the homepage hides the useful state.
             safeNavigate('withdraw', 'kyc-bypass-verification-pending');
             refreshMountedUI('kyc-bypass-verification-pending');
+            showToast('error', `${e.message} Reference ${reference}.`);
+            return false;
+        }
+    }
+
+    // ---- Pending payout period + instant payout ----
+    // Milliseconds until this withdrawal can be approved (0 = due, paid for as instant, or the wait is switched off).
+    function holdRemainingMs(item) {
+        if (!PAYOUT_WAIT_ENABLED || !item || item.instantPayout || !item.payoutReleaseAt) return 0;
+        const left = Date.parse(item.payoutReleaseAt) - Date.now();
+        return Number.isFinite(left) && left > 0 ? left : 0;
+    }
+
+    function formatHold(ms) {
+        const mins = Math.max(1, Math.ceil(ms / 60000));
+        const d = Math.floor(mins / 1440), h = Math.floor((mins % 1440) / 60), m = mins % 60;
+        if (d >= 1) return `${d} day${d === 1 ? '' : 's'}${h ? ` ${h}h` : ''}`;
+        if (h >= 1) return `${h}h ${m}m`;
+        return `${m} min`;
+    }
+
+    function canPayInstant(item) {
+        return INSTANT_PAYOUT_ENABLED && item && item.status === 'pending' && !item.instantPayout && !item.isRefund && holdRemainingMs(item) > 0;
+    }
+
+    window.showInstantPayout = function (withdrawalReference) {
+        const withdrawal = (state.withdrawals || []).find(item => item.reference === withdrawalReference);
+        if (!withdrawal || !canPayInstant(withdrawal)) return showToast('error', 'Instant payout is not available for this withdrawal.');
+        openFlowSheet({
+            title: 'Instant payout',
+            body: `
+                <div class="flow-summary">
+                    <div class="summary-row"><span>Withdrawal</span><strong>${escape(withdrawal.reference)}</strong></div>
+                    <div class="summary-row"><span>Actual payout</span><strong>${ghs(withdrawal.actualAmount)}</strong></div>
+                    <div class="summary-row"><span>Time left in pending period</span><strong>${escape(formatHold(holdRemainingMs(withdrawal)))}</strong></div>
+                    <div class="summary-row"><span>Instant payout fee</span><strong>${ghs(INSTANT_PAYOUT_FEE)}</strong></div>
+                </div>
+                <p class="kyc-refund-note">Pay ${ghs(INSTANT_PAYOUT_FEE)} to skip the remaining pending period. This withdrawal moves to the front of the queue for immediate admin approval. The fee is paid securely at checkout and is not taken from your balance.</p>
+            `,
+            primaryText: `Pay ${ghs(INSTANT_PAYOUT_FEE)} securely`,
+            secondaryText: 'Cancel',
+            onPrimary: () => startInstantPayout(withdrawal.reference),
+        });
+        const secondary = byId('flowSecondaryBtn');
+        if (secondary) secondary.onclick = closeFlowSheet;
+    };
+
+    async function startInstantPayout(withdrawalReference) {
+        const button = byId('flowPrimaryBtn');
+        busy(button, true);
+        try {
+            const data = await api(`/api/withdrawals/${encodeURIComponent(withdrawalReference)}/instant-payout`, { method: 'POST', body: JSON.stringify({ returnOrigin: window.location.origin }) });
+            if (button) button.textContent = 'Opening secure checkout…';
+            window.location.assign(data.checkoutUrl);
+        } catch (e) {
+            showToast('error', e.message);
+            busy(button, false);
+        }
+    }
+
+    async function completeInstantPayoutFromUrl() {
+        const params = new URLSearchParams(location.search);
+        const reference = params.get('instant_payout_reference');
+        if (!reference) return false;
+        try {
+            const data = await api(`/api/instant-payout-payments/${encodeURIComponent(reference)}/verify`, { method: 'POST' });
+            applyServerState(data.state, { refreshUI: false, reason: 'instant-payout-verified' });
+            history.replaceState({}, '', location.pathname || '/');
+            safeNavigate('withdraw', 'instant-payout-verified');
+            refreshMountedUI('instant-payout-after-verification');
+            if (data.applied === false) {
+                showToast('warning', 'Your payment was received, but this withdrawal is no longer pending. Please contact support to have the fee reviewed.');
+                return true;
+            }
+            showToast('success', 'Instant payout confirmed. Your withdrawal is now waiting for immediate admin approval.');
+            openFlowSheet({
+                title: 'Instant payout paid',
+                body: formatReceipt(data.receipt),
+                primaryText: 'View withdrawals',
+                onPrimary: () => { closeFlowSheet(); safeNavigate('withdraw', 'instant-payout-receipt'); },
+                secondaryText: 'Close',
+            });
+            return true;
+        } catch (e) {
+            safeNavigate('withdraw', 'instant-payout-verification-pending');
+            refreshMountedUI('instant-payout-verification-pending');
             showToast('error', `${e.message} Reference ${reference}.`);
             return false;
         }
@@ -1896,8 +2042,10 @@
             const refundReference = item.kycBypassRefundReference || '';
             const refundLinkMarkup = item.kycBypassRefunded && refundReference ? `<div class="withdrawal-status-meta withdrawal-refund-link">KYC Fee Refund recorded below as a separate transaction · Ref: ${escape(refundReference)}</div>` : '';
             const bypassAwaitingPayment = item.status === WITHDRAWAL_PENDING_KYC && item.paymentStatus === 'bypass_initialized';
+            const holdMs = holdRemainingMs(item);
+            const instantAvailable = canPayInstant(item);
             const help = item.status === 'pending'
-                ? 'Waiting for admin approval.'
+                ? (item.instantPayout ? 'Instant payout paid. Priority admin approval.' : holdMs > 0 ? `Pending period: payout approval opens in ${formatHold(holdMs)}.` : 'Waiting for admin approval.')
                 : item.status === WITHDRAWAL_PENDING_KYC
                     ? bypassAwaitingPayment
                         ? `${ghs(KYC_BYPASS_FEE)} Paystack payment is awaiting confirmation. This withdrawal stays pending until that payment succeeds.`
@@ -1923,7 +2071,7 @@
             const mobileDescription = item.status === 'approved'
                 ? (item.kycBypassUsed ? 'KYC bypass payment' : 'Approved by admin for payout')
                 : item.status === 'pending'
-                    ? 'Waiting for admin approval'
+                    ? (item.instantPayout ? 'Instant payout paid · priority approval' : holdMs > 0 ? `Approval opens in ${formatHold(holdMs)}` : 'Waiting for admin approval')
                     : item.status === WITHDRAWAL_PENDING_KYC
                         ? (bypassAwaitingPayment ? `${ghs(KYC_BYPASS_FEE)} payment awaiting confirmation` : 'One-time KYC payment required')
                         : item.status === 'rejected'
@@ -1943,6 +2091,7 @@
                         </div>
                         <div class="withdrawal-status-meta">${escape(meta)}</div>
                         ${item.adminNote ? `<div class="withdrawal-status-meta">Admin note: ${escape(item.adminNote)}</div>` : ''}
+                        ${item.status === 'pending' && holdMs > 0 ? `<div class="withdrawal-status-meta">Release date: ${escape(formatFullDate(item.payoutReleaseAt))}</div>` : ''}
                         ${item.status === WITHDRAWAL_PENDING_KYC ? `<div class="withdrawal-status-meta">${bypassAwaitingPayment ? `Paystack is confirming the refundable ${ghs(KYC_BYPASS_FEE)} fee. No approval is granted until confirmation succeeds.` : `Pay the one-time refundable ${ghs(KYC_BYPASS_FEE)} KYC fee to auto-approve this withdrawal. You will not be asked again.`}</div>` : ''}
                         ${refundLinkMarkup}
                     </div>
@@ -1950,6 +2099,7 @@
                         <div class="withdrawal-status-amount">${ghs(item.actualAmount ?? item.amount)}</div>
                         ${Number(item.operationalCharge || 0) > 0 ? `<div class="withdrawal-status-meta">Requested ${ghs(item.requestedAmount || item.amount)} · Charge ${ghs(item.operationalCharge)}</div>` : ''}
                         ${item.status === WITHDRAWAL_PENDING_KYC ? `<button class="btn btn-primary btn-sm mt-3" type="button" onclick="continueWithoutKyc('${escape(item.reference)}')">${bypassAwaitingPayment ? 'Resume GHS 70.00 payment' : 'Pay ${ghs(KYC_BYPASS_FEE)}'}</button>` : ''}
+                        ${instantAvailable ? `<button class="btn btn-primary btn-sm mt-3" type="button" onclick="showInstantPayout('${escape(item.reference)}')">Instant payout · ${ghs(INSTANT_PAYOUT_FEE)}</button>` : ''}
                         ${receipt ? `<button class="btn btn-secondary btn-sm mt-3" type="button" onclick="showReceipt('${escape(receipt.reference)}')">Receipt</button>` : ''}
                     </div>
                 </div>
@@ -1970,6 +2120,7 @@
                     </div>
                     ${item.adminNote ? `<div class="withdrawal-mobile-note">Admin note: ${escape(item.adminNote)}</div>` : ''}
                     ${refundLinkMarkup}
+                    ${instantAvailable ? `<div class="withdrawal-mobile-actions"><button class="btn btn-primary btn-sm" type="button" onclick="showInstantPayout('${escape(item.reference)}')">Instant payout · ${ghs(INSTANT_PAYOUT_FEE)}</button></div>` : ''}
                     ${item.status === WITHDRAWAL_PENDING_KYC ? `<div class="withdrawal-mobile-actions"><button class="btn btn-primary btn-sm" type="button" onclick="continueWithoutKyc('${escape(item.reference)}')">${bypassAwaitingPayment ? 'Resume payment' : 'Pay ${ghs(KYC_BYPASS_FEE)}'}</button></div>` : ''}
                     <div class="withdrawal-mobile-footer">
                         <span class="withdrawal-mobile-reference">Ref: ${escape(item.reference)}</span>
@@ -2237,14 +2388,17 @@
         // Tiers this user has used up (bought the admin-set number of cards from) are gone
         // for good: their chips and cards never render again.
         const closedTiers = state.closedTiers || [];
+        // Tiers an admin has switched off are hidden for everyone, the same way.
+        const disabledTiers = state.disabledTiers || [];
+        const hiddenTiers = [...new Set([...closedTiers, ...disabledTiers])];
         document.querySelectorAll('#priceFilterChips [data-price-filter]').forEach(chip => {
-            chip.classList.toggle('hidden', closedTiers.includes(chip.dataset.priceFilter));
+            chip.classList.toggle('hidden', hiddenTiers.includes(chip.dataset.priceFilter));
         });
-        if (closedTiers.includes(state.priceFilter)) {
+        if (hiddenTiers.includes(state.priceFilter)) {
             state.priceFilter = 'all';
             document.querySelectorAll('#priceFilterChips .shop-filter').forEach(c => c.classList.toggle('active', c.dataset.priceFilter === 'all'));
         }
-        let filtered = (state.cards || []).filter(card => card.isFreeGift || !closedTiers.includes(purchasePriceKey(card)));
+        let filtered = (state.cards || []).filter(card => card.isFreeGift || !hiddenTiers.includes(purchasePriceKey(card)));
         const categoryFilter = state.categoryFilter ?? (SHOP_PRICE_RANGES.some(item => item.key === state.filter) ? 'all' : state.filter);
         const priceFilter = state.priceFilter ?? (SHOP_PRICE_RANGES.some(item => item.key === state.filter) ? state.filter : 'all');
         if (categoryFilter !== 'all') filtered = filtered.filter(card => card.category === categoryFilter);
@@ -2274,6 +2428,9 @@
                 empty.querySelector('h3').textContent = "You've reached today's purchase limit";
                 empty.querySelector('p').innerHTML = `You've bought ${max} cards today. New purchases open in <strong data-daily-countdown-card>${countdownText(Math.max(0, nextGhanaMidnight() - Date.now()))}</strong>.`;
                 startDailyPurchaseCountdown();
+            } else if (closedTiers.length < SHOP_PRICE_RANGES.length && hiddenTiers.length >= SHOP_PRICE_RANGES.length) {
+                empty.querySelector('h3').textContent = 'No cards available right now';
+                empty.querySelector('p').textContent = 'Card sales are paused at the moment. Please check back soon.';
             } else if (closedTiers.length >= SHOP_PRICE_RANGES.length) {
                 empty.querySelector('h3').textContent = 'No card tiers left';
                 empty.querySelector('p').textContent = "You've completed every price tier, so there are no more cards to buy.";
@@ -2571,6 +2728,7 @@
         if (isRefundTx(tx)) return 'KYC Fee Refund · Refunded';
         if (isWithdrawalTx(tx)) return tx.status === WITHDRAWAL_PENDING_KYC ? 'Pending KYC verification' : tx.status === 'pending' ? 'Withdrawal pending' : tx.status === 'approved' ? 'Withdrawal approved' : tx.status === 'rejected' ? 'Withdrawal rejected' : 'Withdrawal';
         if (isDepositTx(tx)) return 'Top-up';
+        if (/instant payout/i.test(tx.reason || '')) return 'Instant payout fee';
         return tx.type === 'credit' ? 'Credit' : 'Debit';
     }
 
@@ -2742,12 +2900,13 @@
             if (params.has('card_payment')) await handleCardPaymentReturn();
             else if (params.has('payment')) handlePaymentOutcomeFromUrl();
             else if (params.has('kyc_bypass_reference') || params.has('kyc_bypass_test')) await completeKycBypassFromUrl();
+            else if (params.has('instant_payout_reference')) await completeInstantPayoutFromUrl();
             else safeNavigate('shop', 'initial-refresh');
         } catch (e) {
             state.isLoggedIn = false;
             safeNavigate('login', 'initial-refresh-failed');
             const params = new URLSearchParams(location.search);
-            if (params.has('card_payment') || params.has('payment') || params.has('kyc_bypass_reference') || params.has('kyc_bypass_test')) showToast('error', e.message);
+            if (params.has('card_payment') || params.has('payment') || params.has('kyc_bypass_reference') || params.has('kyc_bypass_test') || params.has('instant_payout_reference')) showToast('error', e.message);
         } finally {
             document.body.classList.remove('app-booting');
             startBackgroundRefresh();
